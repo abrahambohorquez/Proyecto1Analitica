@@ -1,25 +1,35 @@
+# ============================================
+# ICFES Córdoba — Dash (UPLOAD + OPTIMIZADO)
+# Tabs:
+#   - Q1 Brechas territoriales
+#   - Q2 Socioeconómico + riesgo
+#   - Q3 Edad + riesgo
+# NO Tukey / NO ANOVA
+# + UI mejorada
+# + Violin plot en Q1
+# + Q2 elimina "SIN ESTRATO"
+# + Heatmap con valores + colores pasteles
+# ============================================
+
+import base64, io, warnings
+from functools import lru_cache
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, no_update
 import dash_bootstrap_components as dbc
 import plotly.express as px
-import pandas as pd
-import numpy as np
-import warnings
-
-from scipy import stats
-import statsmodels.api as sm
-from statsmodels.formula.api import ols
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 warnings.filterwarnings("ignore")
 
-# ==============================
-# CONFIG VISUAL BONITO
-# ==============================
+# ---------- UI / estilo ----------
+THEME = dbc.themes.FLATLY
 PLOT_TEMPLATE = "plotly_white"
 
-# Colores consistentes (no “arcoíris”)
-# (Plotly asigna, pero aquí lo forzamos por categorías conocidas)
+MAX_SAMPLE = 2500  # baja a 1500 si tu PC sufre
 COLOR_ZONA = {"URBANO": "#2E86AB", "RURAL": "#F18F01"}
 
 AREAS = {
@@ -31,47 +41,27 @@ AREAS = {
     "punt_ingles": "Inglés"
 }
 
-# ==============================
-# CARGA / LIMPIEZA
-# ==============================
-df = pd.read_csv("Resultados_ICFES_Cordoba_clean.csv")
+# ====== Memoria servidor (rápido) ======
+DATA = {"df": None, "version": 0, "filename": None}
+
+# ------------------ utils ------------------
+def sample_for_plot(d: pd.DataFrame, seed=1) -> pd.DataFrame:
+    if d is None or len(d) == 0:
+        return d
+    if len(d) <= MAX_SAMPLE:
+        return d
+    return d.sample(n=MAX_SAMPLE, random_state=seed)
 
 def norm_txt(x):
     if pd.isna(x):
         return x
     return str(x).strip().upper()
 
-# Normaliza textos clave (evita "Urbano" vs "URBANO")
-for col in [
-    "cole_mcpio_ubicacion", "cole_area_ubicacion", "cole_naturaleza",
-    "fami_estratovivienda", "fami_educacionmadre", "fami_educacionpadre"
-]:
-    if col in df.columns:
-        df[col] = df[col].map(norm_txt)
-
-# Asegurar numéricos de puntajes
-for c in AREAS:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-df = df[df["punt_global"].notna() & (df["punt_global"] > 0)].copy()
-
-# Listas para filtros
-MUNICIPIOS = sorted(df["cole_mcpio_ubicacion"].dropna().unique())
-ZONAS = sorted(df["cole_area_ubicacion"].dropna().unique())
-NATURALEZAS = sorted(df["cole_naturaleza"].dropna().unique())
-ESTRATOS = sorted(df["fami_estratovivienda"].dropna().unique())
-EDU_MADRE = sorted(df["fami_educacionmadre"].dropna().unique())
-EDU_PADRE = sorted(df["fami_educacionpadre"].dropna().unique())
-
-# ==============================
-# HELPERS
-# ==============================
 def kpi_card(title, value, subtitle=""):
     return dbc.Card(
         dbc.CardBody([
             html.Div(title, className="text-muted", style={"fontSize": "0.9rem"}),
-            html.Div(value, style={"fontSize": "1.7rem", "fontWeight": "800"}),
+            html.Div(value, style={"fontSize": "1.7rem", "fontWeight": "900"}),
             html.Div(subtitle, className="text-muted", style={"fontSize": "0.85rem"})
         ]),
         className="shadow-sm",
@@ -79,106 +69,264 @@ def kpi_card(title, value, subtitle=""):
     )
 
 def make_table(df_small, max_rows=12):
+    if df_small is None or len(df_small) == 0:
+        return dbc.Alert("Sin datos para mostrar.", color="secondary")
     show = df_small.head(max_rows).copy()
     return dbc.Table.from_dataframe(show, striped=True, bordered=False, hover=True, size="sm")
 
-def safe_title(s):
-    return (s or "").title()
+def parse_contents(contents, filename):
+    if contents is None:
+        raise ValueError("No se recibió contenido.")
+    _, content_string = contents.split(",")
+    decoded = base64.b64decode(content_string)
+    fname = (filename or "").lower()
 
-def filtrar(munis, zonas, nats, estratos, edu_m, edu_p, area):
-    d = df.copy()
-    if munis:
+    if fname.endswith(".csv"):
+        try:
+            return pd.read_csv(io.StringIO(decoded.decode("utf-8")), low_memory=False)
+        except UnicodeDecodeError:
+            return pd.read_csv(io.StringIO(decoded.decode("latin-1")), low_memory=False)
+
+    if fname.endswith((".xls", ".xlsx")):
+        return pd.read_excel(io.BytesIO(decoded))
+
+    raise ValueError("Formato no soportado. Sube un .csv o .xlsx")
+
+# ====== Edad (robusta a 'periodo'=20224) ======
+def infer_exam_year(d: pd.DataFrame) -> Optional[pd.Series]:
+    # periodo típico: 20224 -> 2022
+    if "periodo" in d.columns:
+        s = d["periodo"].astype(str).str.extract(r"(\d{4})")[0]
+        return pd.to_numeric(s, errors="coerce")
+    for c in ["estu_anio", "anio", "year"]:
+        if c in d.columns:
+            return pd.to_numeric(d[c], errors="coerce")
+    return None
+
+def infer_birth_year(d: pd.DataFrame) -> Optional[pd.Series]:
+    for c in ["estu_fechanacimiento", "fecha_nacimiento", "birth_date"]:
+        if c in d.columns:
+            dt = pd.to_datetime(d[c], errors="coerce")
+            return dt.dt.year
+    for c in ["estu_anionacimiento", "anio_nacimiento", "birth_year"]:
+        if c in d.columns:
+            return pd.to_numeric(d[c], errors="coerce")
+    return None
+
+def add_age_features(d: pd.DataFrame) -> pd.DataFrame:
+    exam_year = infer_exam_year(d)
+    birth_year = infer_birth_year(d)
+
+    d2 = d.copy()
+    d2["anio_presentacion"] = exam_year if exam_year is not None else np.nan
+    d2["anio_nacimiento"] = birth_year if birth_year is not None else np.nan
+    d2["edad"] = d2["anio_presentacion"] - d2["anio_nacimiento"]
+
+    # limpia outliers
+    d2.loc[(d2["edad"] < 10) | (d2["edad"] > 60), "edad"] = np.nan
+
+    bins = [10, 14, 16, 18, 20, 25, 60]
+    labels = ["10–13", "14–15", "16–17", "18–19", "20–24", "25+"]
+    d2["edad_grupo"] = pd.cut(d2["edad"], bins=bins, labels=labels, include_lowest=True)
+    return d2
+
+def compute_low_perf_flag(d: pd.DataFrame, area: str) -> pd.Series:
+    q25 = d[area].quantile(0.25)
+    return (d[area] <= q25).astype(int)
+
+# ====== Limpieza ======
+def clean_df(dff: pd.DataFrame) -> pd.DataFrame:
+    d = dff.copy()
+
+    # normaliza textos clave
+    for col in [
+        "cole_mcpio_ubicacion", "cole_area_ubicacion", "cole_naturaleza",
+        "fami_estratovivienda", "fami_educacionmadre", "fami_educacionpadre"
+    ]:
+        if col in d.columns:
+            d[col] = d[col].map(norm_txt)
+
+    # puntajes a num
+    for c in AREAS:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "punt_global" in d.columns:
+        d = d[d["punt_global"].notna() & (d["punt_global"] > 0)].copy()
+
+    # reduce memoria
+    for c in [
+        "cole_mcpio_ubicacion", "cole_area_ubicacion", "cole_naturaleza",
+        "fami_estratovivienda", "fami_educacionmadre", "fami_educacionpadre"
+    ]:
+        if c in d.columns:
+            d[c] = d[c].astype("category")
+
+    d = add_age_features(d)
+    return d
+
+# ====== Filtro ======
+def _as_tuple(x):
+    if x is None:
+        return tuple()
+    if isinstance(x, (list, tuple, set, np.ndarray)):
+        return tuple(x)
+    return (x,)
+
+def filter_df(base: pd.DataFrame, munis, zonas, nats, estratos, edu_m, edu_p, area: str) -> pd.DataFrame:
+    d = base
+    if munis and "cole_mcpio_ubicacion" in d.columns:
         d = d[d["cole_mcpio_ubicacion"].isin(munis)]
-    if zonas:
+    if zonas and "cole_area_ubicacion" in d.columns:
         d = d[d["cole_area_ubicacion"].isin(zonas)]
-    if nats:
+    if nats and "cole_naturaleza" in d.columns:
         d = d[d["cole_naturaleza"].isin(nats)]
-    if estratos:
+    if estratos and "fami_estratovivienda" in d.columns:
         d = d[d["fami_estratovivienda"].isin(estratos)]
-    if edu_m:
+    if edu_m and "fami_educacionmadre" in d.columns:
         d = d[d["fami_educacionmadre"].isin(edu_m)]
-    if edu_p:
+    if edu_p and "fami_educacionpadre" in d.columns:
         d = d[d["fami_educacionpadre"].isin(edu_p)]
-
     d = d[d[area].notna()]
     return d
 
-def descriptivas(d, area):
-    # Global
-    out = {}
-    out["n"] = len(d)
-    out["mean"] = float(d[area].mean())
-    out["std"] = float(d[area].std())
-    out["p25"] = float(d[area].quantile(0.25))
-    out["p50"] = float(d[area].quantile(0.50))
-    out["p75"] = float(d[area].quantile(0.75))
-    return out
+# ====== Cache agregados por TAB (rápido) ======
+@lru_cache(maxsize=256)
+def cached_q1(version: int, area: str, munis: Tuple, zonas: Tuple, nats: Tuple, estratos: Tuple, edu_m: Tuple, edu_p: Tuple):
+    base = DATA["df"]
+    d = filter_df(base, list(munis), list(zonas), list(nats), list(estratos), list(edu_m), list(edu_p), area)
+    if "cole_mcpio_ubicacion" not in d.columns:
+        return pd.DataFrame(), pd.DataFrame()
 
-def anova_1way(d, area, factor):
-    # ANOVA 1 vía (rápida y útil)
-    dd = d[[area, factor]].dropna()
-    if dd[factor].nunique() < 2 or len(dd) < 30:
-        return None, None
-
-    model = ols(f"{area} ~ C({factor})", data=dd).fit()
-    aov = sm.stats.anova_lm(model, typ=2)
-
-    # eta^2 (tamaño de efecto simple)
-    ss_factor = aov.loc[f"C({factor})", "sum_sq"]
-    ss_total = aov["sum_sq"].sum()
-    eta2 = float(ss_factor / ss_total) if ss_total > 0 else np.nan
-
-    return aov.reset_index(), eta2
-
-def tukey_posthoc(d, area, factor):
-    dd = d[[area, factor]].dropna()
-    if dd[factor].nunique() < 3 or len(dd) < 60:
-        return None
-    try:
-        res = pairwise_tukeyhsd(endog=dd[area], groups=dd[factor], alpha=0.05)
-        tbl = pd.DataFrame(data=res.summary().data[1:], columns=res.summary().data[0])
-        return tbl
-    except Exception:
-        return None
-
-def insight_text(d, area):
-    # Textos “qué se ve” sin ponernos intensos
-    # Brecha Urbano-Rural
-    ur = None
-    if "URBANO" in d["cole_area_ubicacion"].unique() and "RURAL" in d["cole_area_ubicacion"].unique():
-        mu_u = d.loc[d["cole_area_ubicacion"] == "URBANO", area].mean()
-        mu_r = d.loc[d["cole_area_ubicacion"] == "RURAL", area].mean()
-        ur = mu_u - mu_r
-
-    # Naturaleza (mayor vs menor promedio)
-    nat_rank = (
-        d.groupby("cole_naturaleza")[area].mean()
-        .sort_values(ascending=False)
-        .dropna()
+    muni_stats = (
+        d.groupby("cole_mcpio_ubicacion", observed=True)[area]
+         .agg(media="mean", n="size")
+         .reset_index()
+         .sort_values("media", ascending=False)
     )
-    top_nat = nat_rank.index[0] if len(nat_rank) else None
-    bot_nat = nat_rank.index[-1] if len(nat_rank) else None
-    gap_nat = (nat_rank.iloc[0] - nat_rank.iloc[-1]) if len(nat_rank) >= 2 else None
 
-    lines = []
-    if ur is not None:
-        lines.append(f"En promedio, **URBANO vs RURAL** difiere en **{ur:+.1f} puntos** (positivo = urbano mayor).")
-    if top_nat and bot_nat and gap_nat is not None:
-        lines.append(f"Por **naturaleza**, el promedio más alto es **{safe_title(top_nat)}** y el más bajo **{safe_title(bot_nat)}**; la diferencia es **{gap_nat:.1f} puntos**.")
-    if not lines:
-        lines.append("Con los filtros actuales no se ve una brecha clara (o falta alguna categoría). Prueba ampliar zona o naturaleza.")
-    return " ".join(lines)
+    muni_desc = (
+        d.groupby("cole_mcpio_ubicacion", observed=True)[area]
+         .agg(N="size", Promedio="mean", Std="std")
+         .reset_index()
+         .sort_values("Promedio")
+    )
+    muni_desc["Promedio"] = muni_desc["Promedio"].round(1)
+    muni_desc["Std"] = muni_desc["Std"].round(1)
+    return muni_stats, muni_desc
+
+@lru_cache(maxsize=256)
+def cached_q2(version: int, area: str,
+              munis: Tuple, zonas: Tuple, nats: Tuple, estratos: Tuple, edu_m: Tuple, edu_p: Tuple):
+
+    base = DATA["df"]
+    d = filter_df(base, list(munis), list(zonas), list(nats), list(estratos), list(edu_m), list(edu_p), area)
+
+    needed = ["fami_estratovivienda", "fami_educacionmadre", area]
+    missing = [c for c in needed if c not in d.columns]
+    if missing:
+        return {"ok": False, "error": f"Faltan columnas: {', '.join(missing)}"}
+
+    d_se = d.dropna(subset=["fami_estratovivienda", "fami_educacionmadre", area]).copy()
+    if d_se.empty:
+        return {"ok": True, "d_se": None, "riesgo": pd.DataFrame(), "mean": pd.DataFrame(), "pivot": None}
+
+    # --- limpieza robusta de estrato ---
+    estr = d_se["fami_estratovivienda"].astype(str).str.strip().str.upper()
+    d_se = d_se[~estr.isin(["SIN ESTRATO", "SIN_ESTRATO", "NO APLICA", "N/A", "NA", "", "NONE", "NAN"])].copy()
+
+    # si tras filtrar queda vacío
+    if d_se.empty:
+        return {"ok": True, "d_se": None, "riesgo": pd.DataFrame(), "mean": pd.DataFrame(), "pivot": None}
+
+    # bandera de riesgo: 25% más bajo
+    d_se["bajo_desempeno"] = compute_low_perf_flag(d_se, area)
+
+    riesgo_estrato = (
+        d_se.groupby("fami_estratovivienda", observed=True)["bajo_desempeno"]
+        .mean().mul(100).reset_index(name="riesgo_pct")
+        .sort_values("riesgo_pct", ascending=False)
+    )
+
+    mean_estrato = (
+        d_se.groupby("fami_estratovivienda", observed=True)[area]
+        .agg(Promedio="mean", N="size").reset_index()
+        .sort_values("Promedio")
+    )
+    mean_estrato["Promedio"] = mean_estrato["Promedio"].round(1)
+
+    # pivote estable para heatmap (promedio del puntaje)
+    pivot = (
+        d_se.pivot_table(
+            index="fami_estratovivienda",
+            columns="fami_educacionmadre",
+            values=area,
+            aggfunc="mean"
+        )
+        .sort_index()
+    )
+
+    return {"ok": True, "d_se": d_se, "riesgo": riesgo_estrato, "mean": mean_estrato, "pivot": pivot}
+
+@lru_cache(maxsize=256)
+def cached_q3(version: int, area: str, munis: Tuple, zonas: Tuple, nats: Tuple, estratos: Tuple, edu_m: Tuple, edu_p: Tuple):
+    base = DATA["df"]
+    d = filter_df(base, list(munis), list(zonas), list(nats), list(estratos), list(edu_m), list(edu_p), area)
+
+    if "edad" not in d.columns or d["edad"].dropna().empty:
+        return None
+
+    d_age = d.dropna(subset=["edad", area]).copy()
+    if d_age.empty:
+        return (pd.DataFrame(), pd.DataFrame(), np.nan)
+
+    corr_age = float(d_age[["edad", area]].corr().iloc[0, 1])
+
+    d_age["bajo_desempeno"] = compute_low_perf_flag(d_age, area)
+
+    riesgo_age = (
+        d_age.groupby("edad_grupo", observed=True)["bajo_desempeno"]
+        .mean().mul(100).reset_index(name="riesgo_pct").dropna()
+    )
+
+    mean_age = (
+        d_age.groupby("edad_grupo", observed=True)[area]
+        .agg(Promedio="mean", N="size").reset_index().dropna()
+    )
+    mean_age["Promedio"] = mean_age["Promedio"].round(1)
+
+    return riesgo_age, mean_age, corr_age
 
 # ==============================
 # APP
 # ==============================
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+app = dash.Dash(__name__, external_stylesheets=[THEME])
 app.title = "ICFES Córdoba — Tablero"
+
+tabs = dbc.Tabs(
+    [
+        dbc.Tab(label="Brechas territoriales (Q1)", tab_id="tab-q1"),
+        dbc.Tab(label="Socioeconómico + riesgo (Q2)", tab_id="tab-q2"),
+        dbc.Tab(label="Edad + riesgo (Q3)", tab_id="tab-age"),
+    ],
+    id="tabs",
+    active_tab="tab-q1"
+)
 
 sidebar = dbc.Card(
     dbc.CardBody([
-        html.H4("ICFES Córdoba", style={"fontWeight": "900"}),
-        html.Div("Brechas territoriales y socioeconómicas (Saber 11).", className="text-muted"),
+        html.Div("ICFES Córdoba", style={"fontWeight": "900", "fontSize": "1.2rem"}),
+        html.Div("Brechas territoriales, socioeconómicas y por edad.", className="text-muted"),
+        html.Hr(),
+
+        html.Div("1) Sube tu archivo (CSV o Excel)", className="fw-semibold"),
+        dcc.Upload(
+            id="upload-data",
+            children=dbc.Button("📤 Subir archivo", color="secondary", className="w-100"),
+            multiple=False
+        ),
+        html.Div(id="upload-status", className="text-muted", style={"fontSize": "0.9rem", "marginTop": "8px"}),
+        dcc.Store(id="store-version"),
         html.Hr(),
 
         html.Div("Área / puntaje", className="fw-semibold"),
@@ -191,84 +339,52 @@ sidebar = dbc.Card(
         html.Br(),
 
         html.Div("Municipio (opcional)", className="fw-semibold"),
-        dcc.Dropdown(
-            id="f-muni",
-            options=[{"label": m.title(), "value": m} for m in MUNICIPIOS],
-            multi=True,
-            placeholder="Todos"
-        ),
+        dcc.Dropdown(id="f-muni", options=[], multi=True, placeholder="Todos"),
         html.Br(),
 
         html.Div("Zona (urbano/rural)", className="fw-semibold"),
-        dcc.Checklist(
-            id="f-zona",
-            options=[{"label": z.title(), "value": z} for z in ZONAS],
-            value=ZONAS,
-            inputStyle={"marginRight": "8px", "marginLeft": "4px"}
-        ),
+        dbc.Checklist(id="f-zona", options=[], value=[], inline=False),
         html.Br(),
 
         html.Div("Naturaleza del colegio", className="fw-semibold"),
-        dcc.Dropdown(
-            id="f-nat",
-            options=[{"label": n.title(), "value": n} for n in NATURALEZAS],
-            multi=True,
-            placeholder="Todas"
-        ),
+        dcc.Dropdown(id="f-nat", options=[], multi=True, placeholder="Todas"),
         html.Hr(),
 
         html.Div("Socioeconómico (opcional)", className="fw-semibold"),
         html.Div("Estrato", className="text-muted", style={"fontSize": "0.9rem"}),
-        dcc.Dropdown(
-            id="f-estrato",
-            options=[{"label": e.title(), "value": e} for e in ESTRATOS],
-            multi=True,
-            placeholder="Todos"
-        ),
+        dcc.Dropdown(id="f-estrato", options=[], multi=True, placeholder="Todos"),
         html.Br(),
 
         html.Div("Educación madre", className="text-muted", style={"fontSize": "0.9rem"}),
-        dcc.Dropdown(
-            id="f-edu-m",
-            options=[{"label": e.title(), "value": e} for e in EDU_MADRE],
-            multi=True,
-            placeholder="Todas"
-        ),
+        dcc.Dropdown(id="f-edu-m", options=[], multi=True, placeholder="Todas"),
         html.Br(),
 
         html.Div("Educación padre", className="text-muted", style={"fontSize": "0.9rem"}),
-        dcc.Dropdown(
-            id="f-edu-p",
-            options=[{"label": e.title(), "value": e} for e in EDU_PADRE],
-            multi=True,
-            placeholder="Todas"
-        ),
+        dcc.Dropdown(id="f-edu-p", options=[], multi=True, placeholder="Todas"),
         html.Br(),
 
         dbc.Button("Aplicar filtros", id="btn", color="primary", className="w-100")
     ]),
     className="shadow-sm",
-    style={"borderRadius": "18px"}
+    style={"borderRadius": "18px", "position": "sticky", "top": "14px"}
 )
 
-tabs = dbc.Tabs(
-    [
-        dbc.Tab(label="Brechas territoriales (Q1)", tab_id="tab-q1"),
-        dbc.Tab(label="Socioeconómico + riesgo (Q2)", tab_id="tab-q2"),
-        dbc.Tab(label="Estadística (ANOVA + Tukey)", tab_id="tab-stats"),
-    ],
-    id="tabs",
-    active_tab="tab-q1"
+navbar = dbc.Navbar(
+    dbc.Container([
+        dbc.NavbarBrand("Brechas Educativas — Córdoba", style={"fontWeight": "900"}),
+        dbc.Badge("Analítica computacional para la toma de decisiones", color="secondary", className="ms-2")
+    ]),
+    color="white",
+    dark=False,
+    className="shadow-sm",
+    style={"borderRadius": "18px", "marginBottom": "12px"}
 )
 
 app.layout = dbc.Container([
+    navbar,
     dbc.Row([
         dbc.Col(sidebar, width=3),
         dbc.Col([
-            html.H3("Brechas Educativas — Córdoba", style={"fontWeight": "900"}),
-            html.Div("Gráficas claras + textos interpretativos + estadística básica.", className="text-muted"),
-            html.Br(),
-
             dbc.Row([
                 dbc.Col(html.Div(id="kpi-n"), md=3),
                 dbc.Col(html.Div(id="kpi-mean"), md=3),
@@ -280,14 +396,93 @@ app.layout = dbc.Container([
             dbc.Alert(id="insight", color="secondary", className="shadow-sm"),
             tabs,
             html.Br(),
-
             html.Div(id="contenido")
         ], width=9),
     ], className="g-3")
 ], fluid=True)
 
 # ==============================
-# CALLBACK
+# CALLBACK: CARGA ARCHIVO
+# ==============================
+@app.callback(
+    Output("upload-status", "children"),
+    Output("store-version", "data"),
+    Input("upload-data", "contents"),
+    State("upload-data", "filename"),
+    prevent_initial_call=True
+)
+def cargar_archivo(contents, filename):
+    try:
+        dff = parse_contents(contents, filename)
+        dff = clean_df(dff)
+
+        DATA["df"] = dff
+        DATA["filename"] = filename
+        DATA["version"] += 1
+
+        cached_q1.cache_clear()
+        cached_q2.cache_clear()
+        cached_q3.cache_clear()
+
+        msg = f"✅ Cargado: {filename} | Filas: {len(dff):,}".replace(",", ".")
+        return msg, {"version": DATA["version"]}
+    except Exception as e:
+        DATA["df"] = None
+        DATA["filename"] = None
+        DATA["version"] += 1
+        cached_q1.cache_clear()
+        cached_q2.cache_clear()
+        cached_q3.cache_clear()
+        return f"❌ Error leyendo archivo: {e}", {"version": DATA["version"]}
+
+# ==============================
+# CALLBACK: POBLAR FILTROS
+# ==============================
+@app.callback(
+    Output("f-muni", "options"),
+    Output("f-zona", "options"),
+    Output("f-zona", "value"),
+    Output("f-nat", "options"),
+    Output("f-estrato", "options"),
+    Output("f-edu-m", "options"),
+    Output("f-edu-p", "options"),
+    Input("store-version", "data"),
+    prevent_initial_call=True
+)
+def poblar_filtros(_data):
+    if DATA["df"] is None:
+        return [], [], [], [], [], [], []
+
+    df0 = DATA["df"]
+
+    def get_sorted(col):
+        if col not in df0.columns:
+            return []
+        vals = df0[col].dropna().astype(str).unique().tolist()
+        vals = [v for v in vals if v.strip().upper() not in ("", "NAN", "NONE")]
+        return sorted(vals)
+
+    munis = get_sorted("cole_mcpio_ubicacion")
+    zonas = get_sorted("cole_area_ubicacion")
+    nats  = get_sorted("cole_naturaleza")
+    estr  = get_sorted("fami_estratovivienda")
+    em    = get_sorted("fami_educacionmadre")
+    ep    = get_sorted("fami_educacionpadre")
+
+    zona_opts = [{"label": z.title(), "value": z} for z in zonas]
+
+    return (
+        [{"label": m.title(), "value": m} for m in munis],
+        zona_opts,
+        zonas,
+        [{"label": n.title(), "value": n} for n in nats],
+        [{"label": e.title(), "value": e} for e in estr],
+        [{"label": e.title(), "value": e} for e in em],
+        [{"label": e.title(), "value": e} for e in ep],
+    )
+
+# ==============================
+# CALLBACK PRINCIPAL
 # ==============================
 @app.callback(
     Output("contenido", "children"),
@@ -297,301 +492,291 @@ app.layout = dbc.Container([
     Output("kpi-gap", "children"),
     Output("insight", "children"),
     Input("btn", "n_clicks"),
-    State("tabs", "active_tab"),
+    Input("tabs", "active_tab"),
+    Input("f-area", "value"),
     State("f-muni", "value"),
     State("f-zona", "value"),
     State("f-nat", "value"),
     State("f-estrato", "value"),
     State("f-edu-m", "value"),
     State("f-edu-p", "value"),
-    State("f-area", "value"),
     prevent_initial_call=False
 )
-def actualizar(_, active_tab, munis, zonas, nats, estratos, edu_m, edu_p, area):
+def actualizar(_nclicks, active_tab, area, munis, zonas, nats, estratos, edu_m, edu_p):
 
-    d = filtrar(munis, zonas, nats, estratos, edu_m, edu_p, area)
+    if DATA["df"] is None:
+        empty = kpi_card("—", "—")
+        return (
+            dbc.Alert("Primero sube un archivo (CSV o Excel) desde el panel izquierdo.", color="primary"),
+            empty, empty, empty, empty,
+            "Sube el archivo para habilitar el análisis."
+        )
+
+    munis_t = _as_tuple(munis)
+    zonas_t = _as_tuple(zonas)
+    nats_t  = _as_tuple(nats)
+    estr_t  = _as_tuple(estratos)
+    em_t    = _as_tuple(edu_m)
+    ep_t    = _as_tuple(edu_p)
+
+    d = filter_df(DATA["df"], list(munis_t), list(zonas_t), list(nats_t), list(estr_t), list(em_t), list(ep_t), area)
+
     if d.empty:
         empty = kpi_card("—", "—")
         return dbc.Alert("No hay datos con esos filtros.", color="warning"), empty, empty, empty, empty, "No hay datos para interpretar."
 
-    desc = descriptivas(d, area)
+    # KPIs
+    n = len(d)
+    mean = float(d[area].mean())
+    std = float(d[area].std())
 
-    # KPI "gap" (máx - mín por naturaleza, si aplica)
-    nat_means = d.groupby("cole_naturaleza")[area].mean().dropna()
     gap = "—"
-    if nat_means.size >= 2:
-        gap = f"{(nat_means.max() - nat_means.min()):.1f} pts"
+    if "cole_naturaleza" in d.columns:
+        nat_means = d.groupby("cole_naturaleza", observed=True)[area].mean().dropna()
+        if len(nat_means) >= 2:
+            gap = f"{(nat_means.max() - nat_means.min()):.1f} pts"
 
-    kpi_n = kpi_card("Estudiantes (N)", f"{desc['n']:,}".replace(",", "."))
-    kpi_mean = kpi_card("Promedio", f"{desc['mean']:.1f}", AREAS.get(area, area))
-    kpi_std = kpi_card("Dispersión (Std)", f"{desc['std']:.1f}", "más alto = más variación")
-    kpi_gap = kpi_card("Brecha por naturaleza", gap, "máx − mín (promedios)")
+    kpi_n = kpi_card("Estudiantes (N)", f"{n:,}".replace(",", "."))
+    kpi_mean = kpi_card("Promedio", f"{mean:.1f}", AREAS.get(area, area))
+    kpi_std = kpi_card("Dispersión (Std)", f"{std:.1f}")
+    kpi_gap = kpi_card("Brecha por naturaleza", gap, "máx − mín")
 
-    insight = insight_text(d, area)
-
-    # =========================
-    # TAB Q1: TERRITORIAL
-    # =========================
+    # ======================
+    # Q1: Territorial
+    # ======================
     if active_tab == "tab-q1":
-        # 1) Ranking municipios
-        muni_stats = (
-            d.groupby("cole_mcpio_ubicacion")[area]
-             .agg(media="mean", n="size")
-             .reset_index()
-             .sort_values("media", ascending=False)
-        )
+        v = DATA["version"]
+        muni_stats, muni_desc = cached_q1(v, area, munis_t, zonas_t, nats_t, estr_t, em_t, ep_t)
+
+        if muni_stats is None or muni_stats.empty:
+            return dbc.Alert("No hay columna de municipio (cole_mcpio_ubicacion) en este archivo.", color="warning"), kpi_n, kpi_mean, kpi_std, kpi_gap, "Falta municipio."
 
         fig_rank_top = px.bar(
             muni_stats.head(12),
             x="media", y="cole_mcpio_ubicacion", orientation="h",
             hover_data=["n"],
-            title=f"Top 12 municipios por {AREAS[area]}",
+            title=f"Top 12 municipios por {AREAS.get(area, area)}",
             template=PLOT_TEMPLATE
-        )
-        fig_rank_top.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
-        fig_rank_top.update_xaxes(title="Promedio (pts)")
-        fig_rank_top.update_yaxes(title="Municipio")
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
 
         fig_rank_bottom = px.bar(
             muni_stats.tail(12).sort_values("media"),
             x="media", y="cole_mcpio_ubicacion", orientation="h",
             hover_data=["n"],
-            title=f"Bottom 12 municipios por {AREAS[area]} (prioridad potencial)",
+            title=f"Bottom 12 municipios por {AREAS.get(area, area)}",
             template=PLOT_TEMPLATE
-        )
-        fig_rank_bottom.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
-        fig_rank_bottom.update_xaxes(title="Promedio (pts)")
-        fig_rank_bottom.update_yaxes(title="Municipio")
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
 
-        # 2) Violín legible: Zona
-        fig_violin_zona = px.violin(
-            d, x="cole_area_ubicacion", y=area,
-            box=True, points=False,
+        d_plot = sample_for_plot(d, seed=1)
+
+        fig_box_zona = px.box(
+            d_plot, x="cole_area_ubicacion", y=area, points=False,
             color="cole_area_ubicacion",
             color_discrete_map=COLOR_ZONA,
-            title="Distribución (violín) por zona",
+            title=f"Distribución por zona (muestra ≤ {MAX_SAMPLE})",
             template=PLOT_TEMPLATE
-        )
-        fig_violin_zona.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
-        fig_violin_zona.update_xaxes(title="Zona")
-        fig_violin_zona.update_yaxes(title="Puntaje")
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
 
-        # 3) Violín por naturaleza (clave)
-        fig_violin_nat = px.violin(
-            d, x="cole_naturaleza", y=area,
-            box=True, points=False,
-            title="Distribución (violín) por naturaleza del colegio",
+        fig_box_nat = px.box(
+            d_plot, x="cole_naturaleza", y=area, points=False,
+            title=f"Distribución por naturaleza (muestra ≤ {MAX_SAMPLE})",
             template=PLOT_TEMPLATE
-        )
-        fig_violin_nat.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
-        fig_violin_nat.update_xaxes(title="Naturaleza")
-        fig_violin_nat.update_yaxes(title="Puntaje")
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
 
-        # 4) Interacción simple: promedios zona × naturaleza
-        inter = (
-            d.groupby(["cole_area_ubicacion", "cole_naturaleza"])[area]
-             .mean().reset_index()
-        )
-        fig_inter = px.bar(
-            inter, x="cole_naturaleza", y=area,
+        # --- Violin elegante ---
+        fig_violin = px.violin(
+            d_plot,
+            x="cole_area_ubicacion",
+            y=area,
             color="cole_area_ubicacion",
-            barmode="group",
             color_discrete_map=COLOR_ZONA,
-            title="Promedios: naturaleza × zona (brechas visibles)",
+            box=True,
+            points=False,
             template=PLOT_TEMPLATE
         )
-        fig_inter.update_layout(height=460, margin=dict(l=10, r=10, t=60, b=10))
-        fig_inter.update_xaxes(title="Naturaleza")
-        fig_inter.update_yaxes(title="Promedio (pts)")
-
-        # Descriptivas por municipio (tabla compacta)
-        muni_desc = (
-            d.groupby("cole_mcpio_ubicacion")[area]
-             .agg(N="size", Promedio="mean", Std="std")
-             .reset_index()
-             .sort_values("Promedio")
+        fig_violin.update_layout(
+            title="Distribución detallada por zona",
+            height=420,
+            margin=dict(l=10, r=10, t=60, b=10),
+            violinmode="group"
         )
-        muni_desc["Promedio"] = muni_desc["Promedio"].round(1)
-        muni_desc["Std"] = muni_desc["Std"].round(1)
 
-        texto = html.Div([
-            html.H5("Cómo leer esta pestaña", style={"fontWeight": "800"}),
-            html.Ul([
-                html.Li("Los rankings muestran territorios con desempeño alto/bajo; los de abajo son candidatos naturales a intervención."),
-                html.Li("Los violines muestran la distribución: si un grupo tiene violín más “bajo” y “ancho”, tiende a concentrarse en puntajes menores y con más variación."),
-                html.Li("La barra naturaleza×zona ayuda a ver si la brecha cambia según el contexto rural/urbano.")
-            ], className="text-muted")
-        ])
-
-        return dbc.Container([
-            texto,
+        contenido = dbc.Container([
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_rank_top), md=6),
-                dbc.Col(dcc.Graph(figure=fig_rank_bottom), md=6),
+                dbc.Col(dcc.Graph(figure=fig_rank_top, config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=fig_rank_bottom, config={"displayModeBar": False}), md=6),
+            ], className="g-3"),
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=fig_box_zona, config={"displayModeBar": False}), md=4),
+                dbc.Col(dcc.Graph(figure=fig_box_nat, config={"displayModeBar": False}), md=4),
+                dbc.Col(dcc.Graph(figure=fig_violin, config={"displayModeBar": False}), md=4),
+            ], className="g-3"),
+            html.Hr(),
+            html.H5("Resumen por municipio", style={"fontWeight": "900"}),
+            make_table(muni_desc, max_rows=15)
+        ], fluid=True)
+
+        insight = "Q1 ranking municipal"
+        return contenido, kpi_n, kpi_mean, kpi_std, kpi_gap, insight
+
+    # ======================
+    # Q2: Socioeconómico + riesgo
+    # ======================
+
+    if active_tab == "tab-q2":
+        v = DATA["version"]
+        out = cached_q2(v, area, munis_t, zonas_t, nats_t, estr_t, em_t, ep_t)
+
+        if not out.get("ok", False):
+            return dbc.Container([
+                dbc.Alert(f"Q2 no puede correr: {out.get('error','Error desconocido')}", color="warning"),
+                dbc.Badge("Tip: revisa que existan fami_estratovivienda y fami_educacionmadre.", color="secondary")
+            ], fluid=True), kpi_n, kpi_mean, kpi_std, kpi_gap, "Q2 con columnas faltantes."
+
+        riesgo_estrato = out["riesgo"]
+        mean_estrato = out["mean"]
+        pivot = out["pivot"]
+        d_se = out["d_se"]
+
+        if d_se is None or riesgo_estrato.empty or pivot is None or pivot.empty:
+            return dbc.Alert("Q2: no hay datos válidos (tras filtrar SIN ESTRATO y vacíos).", color="warning"), \
+                kpi_n, kpi_mean, kpi_std, kpi_gap, "Q2 sin datos."
+
+        # muestra para plots rápidos
+        d_plot = sample_for_plot(d_se, seed=2)
+
+        fig_riesgo = px.bar(
+            riesgo_estrato,
+            x="fami_estratovivienda",
+            y="riesgo_pct",
+            title="Riesgo de bajo desempeño por estrato (25% más bajo)",
+            template=PLOT_TEMPLATE
+        ).update_layout(height=380, margin=dict(l=10, r=10, t=60, b=10))
+
+        fig_box = px.box(
+            d_plot,
+            x="fami_estratovivienda",
+            y=area,
+            points=False,
+            title=f"Puntaje por estrato (muestra ≤ {MAX_SAMPLE})",
+            template=PLOT_TEMPLATE
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+
+        # colores pastel seguros (lista explícita → no depende de nombres)
+        pastel_scale = [
+            "#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6",
+            "#4292c6", "#2171b5"
+        ]
+
+        # Heatmap estable: px.imshow con valores
+        fig_heat = px.imshow(
+            pivot.values,
+            x=[str(c) for c in pivot.columns],
+            y=[str(i) for i in pivot.index],
+            color_continuous_scale=pastel_scale,
+            text_auto=".1f",
+            aspect="auto",
+            template=PLOT_TEMPLATE
+        )
+        fig_heat.update_layout(
+            title="Promedio: estrato × educación madre",
+            height=520,
+            margin=dict(l=10, r=10, t=60, b=10),
+            xaxis_title="Educación madre",
+            yaxis_title="Estrato"
+        )
+
+        contenido = dbc.Container([
+            html.H5("Q2: Brechas socioeconómicas (estrato/educación) + riesgo", style={"fontWeight": "900"}),
+
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=fig_riesgo, config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=fig_box, config={"displayModeBar": False}), md=6),
             ], className="g-3"),
 
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_violin_zona), md=6),
-                dbc.Col(dcc.Graph(figure=fig_violin_nat), md=6),
-            ], className="g-3"),
-
-            dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_inter), md=12),
+                dbc.Col(dcc.Graph(figure=fig_heat, config={"displayModeBar": False}), md=12),
             ], className="g-3"),
 
             html.Hr(),
-            html.H5("Resumen descriptivo por municipio (compacto)", style={"fontWeight": "800"}),
-            make_table(muni_desc, max_rows=15)
-        ], fluid=True), kpi_n, kpi_mean, kpi_std, kpi_gap, insight
+            html.H5("Promedios por estrato", style={"fontWeight": "900"}),
+            make_table(mean_estrato.rename(columns={"fami_estratovivienda": "Estrato"}), max_rows=20)
+        ], fluid=True)
 
-    # =========================
-    # TAB Q2: SOCIOECONÓMICO
-    # =========================
-    if active_tab == "tab-q2":
-        # 1) Violín por estrato (siempre sirve)
-        fig_violin_estrato = px.violin(
-            d, x="fami_estratovivienda", y=area,
-            box=True, points=False,
-            title="Distribución (violín) por estrato",
+        insight = "Q2 diferencias socioeconómicas"
+        return contenido, kpi_n, kpi_mean, kpi_std, kpi_gap, insight
+
+    # ======================
+    # Q3: Edad + riesgo
+    # ======================
+    if active_tab == "tab-age":
+        v = DATA["version"]
+        out = cached_q3(v, area, munis_t, zonas_t, nats_t, estr_t, em_t, ep_t)
+        if out is None:
+            return dbc.Container([
+                dbc.Alert(
+                    "Q3 no puede calcular edad. Necesitas 'periodo' (o año) y 'estu_fechanacimiento' (o similar).",
+                    color="warning"
+                ),
+                html.Div("Columnas detectadas (muestra):", className="fw-semibold"),
+                dbc.Badge(", ".join(list(d.columns)[:60]) + (" ..." if len(d.columns) > 60 else ""), color="secondary")
+            ], fluid=True), kpi_n, kpi_mean, kpi_std, kpi_gap, "No hay edad."
+
+        riesgo_age, mean_age, corr_age = out
+        if riesgo_age.empty:
+            return dbc.Alert("Q3: no hay edad válida con esos filtros.", color="warning"), kpi_n, kpi_mean, kpi_std, kpi_gap, "Q3 sin datos."
+
+        d_age = d.dropna(subset=["edad", area]).copy()
+        d_plot = sample_for_plot(d_age, seed=3)
+
+        fig_hist = px.histogram(
+            d_plot, x="edad", nbins=25,
+            title=f"Distribución de edad (muestra ≤ {MAX_SAMPLE})",
             template=PLOT_TEMPLATE
-        )
-        fig_violin_estrato.update_layout(height=440, margin=dict(l=10, r=10, t=60, b=10))
-        fig_violin_estrato.update_xaxes(title="Estrato")
-        fig_violin_estrato.update_yaxes(title="Puntaje")
+        ).update_layout(height=380, margin=dict(l=10, r=10, t=60, b=10))
 
-        # 2) Heatmap: estrato × educación madre (promedio)
-        heat = (
-            d.groupby(["fami_estratovivienda", "fami_educacionmadre"])[area]
-             .mean().reset_index()
-        )
-        fig_heat = px.density_heatmap(
-            heat,
-            x="fami_educacionmadre",
-            y="fami_estratovivienda",
-            z=area,
-            histfunc="avg",
-            title="Mapa de promedios: estrato × educación de la madre",
+        fig_scatter = px.scatter(
+            d_plot, x="edad", y=area,
+            title=f"Edad vs {AREAS.get(area, area)} (muestra ≤ {MAX_SAMPLE})",
+            template=PLOT_TEMPLATE,
+            opacity=0.55,
+            render_mode="webgl"
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+
+        fig_box = px.box(
+            d_plot, x="edad_grupo", y=area, points=False,
+            title=f"Puntaje por grupo de edad (muestra ≤ {MAX_SAMPLE})",
             template=PLOT_TEMPLATE
-        )
-        fig_heat.update_layout(height=520, margin=dict(l=10, r=10, t=60, b=10))
-        fig_heat.update_xaxes(title="Educación madre")
-        fig_heat.update_yaxes(title="Estrato")
+        ).update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
 
-        # 3) Promedios por educación padres (barras)
-        edu_stats = (
-            d.groupby("fami_educacionmadre")[area]
-             .agg(Promedio="mean", N="size")
-             .reset_index()
-             .sort_values("Promedio")
-        )
-        edu_stats["Promedio"] = edu_stats["Promedio"].round(1)
-
-        fig_edu = px.bar(
-            edu_stats,
-            x="Promedio",
-            y="fami_educacionmadre",
-            orientation="h",
-            hover_data=["N"],
-            title="Promedio por educación de la madre (con N)",
+        fig_riesgo = px.bar(
+            riesgo_age, x="edad_grupo", y="riesgo_pct",
+            title="Riesgo de bajo desempeño por grupo de edad (25% más bajo)",
             template=PLOT_TEMPLATE
-        )
-        fig_edu.update_layout(height=520, margin=dict(l=10, r=10, t=60, b=10))
-        fig_edu.update_xaxes(title="Promedio (pts)")
-        fig_edu.update_yaxes(title="Educación madre")
+        ).update_layout(height=380, margin=dict(l=10, r=10, t=60, b=10))
 
-        texto = html.Div([
-            html.H5("Qué buscar aquí", style={"fontWeight": "800"}),
-            html.Ul([
-                html.Li("Si el violín por estrato se desplaza hacia abajo en estratos bajos, hay un gradiente socioeconómico fuerte."),
-                html.Li("El heatmap deja ver combinaciones críticas (estrato bajo + baja educación parental)."),
-                html.Li("La barra por educación parental te ayuda a describir la brecha de forma simple y contundente.")
-            ], className="text-muted")
-        ])
+        texto = f"Correlación simple (edad vs puntaje) ≈ {corr_age:+.2f} (no implica causalidad)."
 
-        return dbc.Container([
-            texto,
+        contenido = dbc.Container([
+            html.H5("Q3: Edad + riesgo", style={"fontWeight": "900"}),
+            dbc.Alert(texto, color="info"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_violin_estrato), md=6),
-                dbc.Col(dcc.Graph(figure=fig_heat), md=6),
+                dbc.Col(dcc.Graph(figure=fig_hist, config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=fig_riesgo, config={"displayModeBar": False}), md=6),
             ], className="g-3"),
             dbc.Row([
-                dbc.Col(dcc.Graph(figure=fig_edu), md=12),
+                dbc.Col(dcc.Graph(figure=fig_scatter, config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=fig_box, config={"displayModeBar": False}), md=6),
             ], className="g-3"),
-        ], fluid=True), kpi_n, kpi_mean, kpi_std, kpi_gap, insight
+            html.Hr(),
+            html.H5("Promedios por grupo de edad", style={"fontWeight": "900"}),
+            make_table(mean_age.rename(columns={"edad_grupo": "Grupo edad"}).sort_values("Promedio"), max_rows=20)
+        ], fluid=True)
 
-    # =========================
-    # TAB STATS: ANOVA + TUKEY + DESCRIPTIVAS
-    # =========================
-    # Descriptivas por grupo (naturaleza y zona)
-    desc_nat = (
-        d.groupby("cole_naturaleza")[area]
-         .agg(N="size", Promedio="mean", Std="std")
-         .reset_index()
-         .sort_values("Promedio", ascending=False)
-    )
-    desc_nat["Promedio"] = desc_nat["Promedio"].round(1)
-    desc_nat["Std"] = desc_nat["Std"].round(1)
+        insight = "Q3 relación edad-riesgo"
+        return contenido, kpi_n, kpi_mean, kpi_std, kpi_gap, insight
 
-    desc_zona = (
-        d.groupby("cole_area_ubicacion")[area]
-         .agg(N="size", Promedio="mean", Std="std")
-         .reset_index()
-         .sort_values("Promedio", ascending=False)
-    )
-    desc_zona["Promedio"] = desc_zona["Promedio"].round(1)
-    desc_zona["Std"] = desc_zona["Std"].round(1)
-
-    # ANOVA 1 vía: naturaleza
-    aov_nat, eta_nat = anova_1way(d, area, "cole_naturaleza")
-    aov_zona, eta_zona = anova_1way(d, area, "cole_area_ubicacion")
-
-    tukey_nat = tukey_posthoc(d, area, "cole_naturaleza")
-
-    blocks = []
-
-    blocks.append(html.Div([
-        html.H5("Descriptivas", style={"fontWeight": "800"}),
-        html.P("Estas tablas resumen tamaño de muestra, promedio y dispersión por grupo.", className="text-muted"),
-        html.H6("Por naturaleza", style={"fontWeight": "700"}),
-        make_table(desc_nat, max_rows=20),
-        html.Br(),
-        html.H6("Por zona", style={"fontWeight": "700"}),
-        make_table(desc_zona, max_rows=10),
-    ]))
-
-    blocks.append(html.Hr())
-
-    # ANOVA
-    aov_texts = []
-    if aov_nat is not None:
-        p = float(aov_nat.loc[aov_nat["index"] == "C(cole_naturaleza)", "PR(>F)"].values[0])
-        aov_texts.append(f"ANOVA (naturaleza): p-value = {p:.4g} | tamaño de efecto (eta²) ≈ {eta_nat:.3f}")
-    else:
-        aov_texts.append("ANOVA (naturaleza): no se pudo estimar (pocos grupos o pocos datos).")
-
-    if aov_zona is not None:
-        p = float(aov_zona.loc[aov_zona["index"] == "C(cole_area_ubicacion)", "PR(>F)"].values[0])
-        aov_texts.append(f"ANOVA (zona): p-value = {p:.4g} | tamaño de efecto (eta²) ≈ {eta_zona:.3f}")
-    else:
-        aov_texts.append("ANOVA (zona): no se pudo estimar (pocos grupos o pocos datos).")
-
-    blocks.append(html.Div([
-        html.H5("ANOVA (¿hay diferencias significativas?)", style={"fontWeight": "800"}),
-        dbc.Alert(" | ".join(aov_texts), color="info")
-    ]))
-
-    # Tukey (posthoc)
-    blocks.append(html.Div([
-        html.H5("Post-hoc Tukey (¿entre qué grupos está la diferencia?)", style={"fontWeight": "800"}),
-        html.P("Solo se calcula si hay suficientes categorías y datos.", className="text-muted"),
-        make_table(tukey_nat, max_rows=15) if tukey_nat is not None else dbc.Alert(
-            "Tukey no disponible con los filtros actuales (pocos grupos o poco N).",
-            color="secondary"
-        )
-    ]))
-
-    return dbc.Container(blocks, fluid=True), kpi_n, kpi_mean, kpi_std, kpi_gap, insight
-
+    return dbc.Alert("Selecciona una pestaña.", color="secondary"), kpi_n, kpi_mean, kpi_std, kpi_gap, "—"
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False, port=8050)
+    app.run(debug=False, use_reloader=False, port=8050)
