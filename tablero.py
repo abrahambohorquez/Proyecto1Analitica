@@ -1,14 +1,5 @@
 # ============================================
 # ICFES Córdoba — Dash (UPLOAD + OPTIMIZADO)
-# Tabs:
-#   - Q1 Brechas territoriales
-#   - Q2 Socioeconómico + riesgo
-#   - Q3 Edad + riesgo
-# NO Tukey / NO ANOVA
-# + UI mejorada
-# + Violin plot en Q1
-# + Q2 elimina "SIN ESTRATO"
-# + Heatmap con valores + colores pasteles
 # ============================================
 
 import base64, io, warnings
